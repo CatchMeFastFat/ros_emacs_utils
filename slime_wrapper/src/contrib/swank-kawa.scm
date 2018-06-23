@@ -809,6 +809,12 @@
          (l (values-to-list (eval form env))))
     (apply cat (map pprint-to-string l))))
 
+(defslimefun eval-and-grab-output (env string)
+  (let ((form (read (open-input-string string))))
+    (let-values ((values (eval form env)))
+      (list ""
+            (format #f "~{~S~^~%~}" values)))))
+
 (df call-with-abort (f)
   (try-catch (f) (ex <throwable> (exception-message ex))))
 
@@ -1583,7 +1589,11 @@
 
 ;; Enable breakpoints event on the breakpoint function.
 (df request-breakpoint ((vm <vm>))
-  (let* ((class :: <class-type> (1st (! classesByName vm "swank$Mnkawa")))
+  (let* ((swank-classes (! classesByName vm "swank-kawa"))
+         (swank-classes-legacy (! classesByName vm "swank$Mnkawa"))
+         (class :: <class-type> (1st (if (= (length swank-classes) 0)
+                                         swank-classes-legacy
+                                         swank-classes)))
          (meth :: <meth-ref> (1st (! methodsByName class "breakpoint")))
          (erm (! eventRequestManager vm))
          (req (! createBreakpointRequest erm (! location meth))))
@@ -1969,8 +1979,14 @@
 (df init-global-field ((vm <vm>))
   (when (nul? *global-get-mirror*)
     (set (@s <swank-global-variable> var) #!null) ; prepare class
-    (let* ((c (as <com.sun.jdi.ClassType>
-                  (1st (! classes-by-name vm "swank$Mnglobal$Mnvariable"))))
+    (let* ((swank-global-variable-classes
+            (! classes-by-name vm "swank-global-variable"))
+           (swank-global-variable-classes-legacy
+            (! classes-by-name vm "swank$Mnglobal$Mnvariable"))
+           (c (as <com.sun.jdi.ClassType>
+                  (1st (if (= (length swank-global-variable-classes) 0)
+                           swank-global-variable-classes-legacy
+                           swank-global-variable-classes))))
            (f (! fieldByName c "var")))
       (set *global-get-mirror* (fun () (! getValue c f)))
       (set *global-set-mirror* (fun ((v <obj-ref>)) (! setValue c f v))))

@@ -13,9 +13,10 @@
   (:slime-dependencies slime-parse slime-editing-commands slime-autodoc)
   (:swank-dependencies swank-c-p-c)
   (:on-load
-   (push 
+   (push
     `(progn
-       (setq slime-complete-symbol-function ',slime-complete-symbol-function)
+       (remove-hook 'slime-completion-at-point-functions
+		    #'slime-c-p-c-completion-at-point)
        (remove-hook 'slime-connected-hook 'slime-c-p-c-on-connect)
        ,@(when (featurep 'slime-repl)
                `((define-key slime-mode-map "\C-c\C-s"
@@ -23,7 +24,8 @@
                  (define-key slime-repl-mode-map "\C-c\C-s"
                    ',(lookup-key slime-repl-mode-map "\C-c\C-s")))))
     slime-c-p-c-init-undo-stack)
-   (setq slime-complete-symbol-function 'slime-complete-symbol*)
+   (add-hook 'slime-completion-at-point-functions
+	     #'slime-c-p-c-completion-at-point)
    (define-key slime-mode-map "\C-c\C-s" 'slime-complete-form)
    (when (featurep 'slime-repl)
      (define-key slime-repl-mode-map "\C-c\C-s" 'slime-complete-form)))
@@ -171,6 +173,9 @@ terminates a current completion."
   (or (slime-maybe-complete-as-filename)
       (slime-expand-abbreviations-and-complete)))
 
+(defun slime-c-p-c-completion-at-point ()
+  #'slime-complete-symbol*)
+
 ;; FIXME: factorize
 (defun slime-expand-abbreviations-and-complete ()
   (let* ((end (move-marker (make-marker) (slime-symbol-end-pos)))
@@ -269,7 +274,7 @@ current buffer."
     (let ((result (slime-eval `(swank:completions-for-character
                                 ,(cl-subseq prefix 2)))))
       (when (car result)
-        (list (mapcar 'append-char-syntax (car result))
+        (list (mapcar #'append-char-syntax (car result))
               (append-char-syntax (cadr result)))))))
 
 
