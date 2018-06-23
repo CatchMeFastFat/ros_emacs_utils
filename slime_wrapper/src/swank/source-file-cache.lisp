@@ -121,7 +121,7 @@ If POSITION is given, set the STREAM's file position first."
     (read-snippet s position)))
 
 (defun skip-comments-and-whitespace (stream)
-  (case (peek-char nil stream nil nil)
+  (case (peek-char nil stream)
     ((#\Space #\Tab #\Newline #\Linefeed #\Page)
      (read-char stream)
      (skip-comments-and-whitespace stream))

@@ -41,16 +41,7 @@
     (with-symbol 'who-calls 'sb-introspect))
   ;; ... for restart-frame support (1.0.2)
   (defun sbcl-with-restart-frame ()
-    (with-symbol 'frame-has-debug-tag-p 'sb-debug))
-  ;; ... for :setf :inverse info (1.1.17)
-  (defun sbcl-with-setf-inverse-meta-info ()
-    (boolean-to-feature-expression
-     ;; going through FIND-SYMBOL since META-INFO was renamed from
-     ;; TYPE-INFO in 1.2.10.
-     (let ((sym (find-symbol "META-INFO" "SB-C")))
-       (and sym
-            (fboundp sym)
-            (funcall sym :setf :inverse ()))))))
+    (with-symbol 'frame-has-debug-tag-p 'sb-debug)))
 
 ;;; swank-mop
 
@@ -98,32 +89,16 @@
     ((member :win32 *features*) nil)
     (t :fd-handler)))
 
-
-(defun resolve-hostname (host)
-  "Returns valid IPv4 or IPv6 address for the host."
-  ;; get all IPv4 and IPv6 addresses as a list
-  (let* ((host-ents (multiple-value-list (sb-bsd-sockets:get-host-by-name host)))
-         ;; remove protocols for which we don't have an address
-         (addresses (remove-if-not #'sb-bsd-sockets:host-ent-address host-ents)))
-    ;; Return the first one or nil,
-    ;; but actually, it shouln't return nil, because
-    ;; get-host-by-name will signal NAME-SERVICE-ERROR condition
-    ;; if there isn't any address for the host.
-    (first addresses)))
-
+(defun resolve-hostname (name)
+  (car (sb-bsd-sockets:host-ent-addresses
+        (sb-bsd-sockets:get-host-by-name name))))
 
 (defimplementation create-socket (host port &key backlog)
-  (let* ((host-ent (resolve-hostname host))
-         (socket (make-instance (cond #+#.(swank/backend:with-symbol 'inet6-socket 'sb-bsd-sockets)
-                                      ((eql (sb-bsd-sockets:host-ent-address-type host-ent) 10)
-                                       'sb-bsd-sockets:inet6-socket)
-                                      (t
-                                       'sb-bsd-sockets:inet-socket))
-                                :type :stream
-                                :protocol :tcp)))
+  (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+                               :type :stream
+                               :protocol :tcp)))
     (setf (sb-bsd-sockets:sockopt-reuse-address socket) t)
-    (sb-bsd-sockets:socket-bind socket (sb-bsd-sockets:host-ent-address host-ent) port)
-
+    (sb-bsd-sockets:socket-bind socket (resolve-hostname host) port)
     (sb-bsd-sockets:socket-listen socket (or backlog 5))
     socket))
 
@@ -163,13 +138,13 @@
 
   (defun sigio-handler (signal code scp)
     (declare (ignore signal code scp))
-    (sb-sys:with-interrupts
-      (mapc (lambda (handler)
-              (funcall (the function (cdr handler))))
-            *sigio-handlers*)))
+    (mapc (lambda (handler)
+            (funcall (the function (cdr handler))))
+          *sigio-handlers*))
 
   (defun set-sigio-handler ()
-    (sb-sys:enable-interrupt sb-unix:sigio #'sigio-handler))
+    (sb-sys:enable-interrupt sb-unix:sigio (lambda (signal code scp)
+                                             (sigio-handler signal code scp))))
 
   (defun enable-sigio-on-fd (fd)
     (sb-posix::fcntl fd sb-posix::f-setfl sb-posix::o-async)
@@ -332,7 +307,8 @@
     (default-directory)))
 
 (defun make-socket-io-stream (socket external-format buffering)
-  (let ((args `(:output t
+  (let ((args `(,@()
+                :output t
                 :input t
                 :element-type ,(if external-format
                                    'character
@@ -341,7 +317,8 @@
                 ,@(cond ((and external-format (sb-int:featurep :sb-unicode))
                          `(:external-format ,external-format))
                         (t '()))
-                :serve-events ,(eq :fd-handler swank:*communication-style*)
+                :serve-events ,(eq :fd-handler
+                                   (swank-value '*communication-style* t))
                   ;; SBCL < 1.0.42.43 doesn't support :SERVE-EVENTS
                   ;; argument.
                 :allow-other-keys t)))
@@ -367,10 +344,7 @@
     (symbol (member feature list :test #'eq))
     (cons (flet ((subfeature-in-list-p (subfeature)
                    (feature-in-list-p subfeature list)))
-            ;; Don't use ECASE since SBCL also has :host-feature,
-            ;; don't need to handle it or anything else appearing in
-            ;; the future or in erronous code.
-            (case (first feature)
+            (ecase (first feature)
               (:or  (some  #'subfeature-in-list-p (rest feature)))
               (:and (every #'subfeature-in-list-p (rest feature)))
               (:not (destructuring-bind (e) (cdr feature)
@@ -444,13 +418,16 @@
     (loop for p in (remove-if-not #'sbcl-package-p (list-all-packages))
           collect (cons (package-name p) readtable))))
 
-;;; Packages
-
-#+#.(swank/backend:with-symbol 'package-local-nicknames 'sb-ext)
-(defimplementation package-local-nicknames (package)
-  (sb-ext:package-local-nicknames package))
-
 ;;; Utilities
+
+(defun swank-value (name &optional errorp)
+  ;; Easy way to refer to symbol values in SWANK, which doesn't yet exist when
+  ;; this is file is loaded.
+  (let ((symbol (find-symbol (string name) :swank)))
+    (if (and symbol (or errorp (boundp symbol)))
+        (symbol-value symbol)
+        (when errorp
+          (error "~S does not exist in SWANK." name)))))
 
 #+#.(swank/backend:with-symbol 'function-lambda-list 'sb-introspect)
 (defimplementation arglist (fname)
@@ -519,12 +496,6 @@ information."
                       (sb-c:compiler-error  :error)
                       (reader-error         :read-error)
                       (error                :error)
-                      #+#.(swank/backend:with-symbol early-deprecation-warning sb-ext)
-                      (sb-ext:early-deprecation-warning :early-deprecation-warning)
-                      #+#.(swank/backend:with-symbol late-deprecation-warning sb-ext)
-                      (sb-ext:late-deprecation-warning :late-deprecation-warning)
-                      #+#.(swank/backend:with-symbol final-deprecation-warning sb-ext)
-                      (sb-ext:final-deprecation-warning :final-deprecation-warning)
                       #+#.(swank/backend:with-symbol redefinition-warning
                             sb-kernel)
                       (sb-kernel:redefinition-warning
@@ -719,11 +690,13 @@ QUALITIES is an alist with (quality . value)"
 (sb-alien:define-alien-routine (#-win32 "tempnam" #+win32 "_tempnam" tempnam)
     sb-alien:c-string
   (dir sb-alien:c-string)
-  (prefix sb-alien:c-string)))
+  (prefix sb-alien:c-string))
+
+)
 
 (defun temp-file-name ()
   "Return a temporary file name to compile strings into."
-  (tempnam nil "slime"))
+  (tempnam nil nil))
 
 (defvar *trap-load-time-warnings* t)
 
@@ -742,9 +715,8 @@ QUALITIES is an alist with (quality . value)"
                  (with-compilation-unit
                      (:source-plist (list :emacs-buffer buffer
                                           :emacs-filename filename
-                                          :emacs-package (package-name *package*)
-                                          :emacs-position position
-                                          :emacs-string string)
+                                          :emacs-string string
+                                          :emacs-position position)
                       :source-namestring filename
                       :allow-other-keys t)
                    (compile-file *buffer-tmpfile* :external-format :utf-8)))))
@@ -988,12 +960,6 @@ QUALITIES is an alist with (quality . value)"
                                :function
                                (or name (function-name function))))
 
-(defun setf-expander (symbol)
-  (or
-   #+#.(swank/sbcl::sbcl-with-setf-inverse-meta-info)
-   (sb-int:info :setf :inverse symbol)
-   (sb-int:info :setf :expander symbol)))
-
 (defimplementation describe-symbol-for-emacs (symbol)
   "Return a plist describing SYMBOL.
 Return NIL if the symbol is unbound."
@@ -1018,8 +984,9 @@ Return NIL if the symbol is unbound."
                (t :function))
          (doc 'function)))
       (maybe-push
-       :setf (and (setf-expander symbol) 
-                  (doc 'setf)))
+       :setf (if (or (sb-int:info :setf :inverse symbol)
+                     (sb-int:info :setf :expander symbol))
+                 (doc 'setf)))
       (maybe-push
        :type (if (sb-int:info :type :kind symbol)
                  (doc 'type)))
@@ -1032,7 +999,8 @@ Return NIL if the symbol is unbound."
     (:function
      (describe (symbol-function symbol)))
     (:setf
-     (describe (setf-expander symbol)))
+     (describe (or (sb-int:info :setf :inverse symbol)
+                   (sb-int:info :setf :expander symbol))))
     (:class
      (describe (find-class symbol)))
     (:type
@@ -1106,29 +1074,8 @@ Return a list of the form (NAME LOCATION)."
 
 ;;; macroexpansion
 
-(defimplementation macroexpand-all (form &optional env)
-  (sb-cltl2:macroexpand-all form env))
-
-(defimplementation collect-macro-forms (form &optional environment)
-  (let ((macro-forms '())
-        (compiler-macro-forms '())
-        (function-quoted-forms '()))
-    (sb-walker:walk-form
-     form environment
-     (lambda (form context environment)
-       (declare (ignore context))
-       (when (and (consp form)
-                  (symbolp (car form)))
-         (cond ((eq (car form) 'function)
-                (push (cadr form) function-quoted-forms))
-               ((member form function-quoted-forms)
-                nil)
-               ((macro-function (car form) environment)
-                (push form macro-forms))
-               ((not (eq form (compiler-macroexpand-1 form environment)))
-                (push form compiler-macro-forms))))
-       form))
-    (values macro-forms compiler-macro-forms)))
+(defimplementation macroexpand-all (form)
+  (sb-cltl2:macroexpand-all form))
 
 
 ;;; Debugging
@@ -1270,11 +1217,7 @@ stack."
 
 (defun code-location-source-location (code-location)
   (let* ((dsource (sb-di:code-location-debug-source code-location))
-         (plist (sb-c::debug-source-plist dsource))
-         (package (getf plist :emacs-package))
-         (*package* (or (and package
-                             (find-package package))
-                        *package*)))
+         (plist (sb-c::debug-source-plist dsource)))
     (if (getf plist :emacs-buffer)
         (emacs-buffer-source-location code-location plist)
         #+#.(swank/backend:with-symbol 'debug-source-from 'sb-di)
@@ -1309,7 +1252,7 @@ stack."
 (defun lisp-source-location (code-location)
   (let ((source (prin1-to-string
                  (sb-debug::code-location-source-form code-location 100)))
-        (condition swank:*swank-debugger-condition*))
+        (condition (swank-value '*swank-debugger-condition*)))
     (if (and (typep condition 'sb-impl::step-form-condition)
              (search "SB-IMPL::WITH-STEPPING-ENABLED" source
                      :test #'char-equal)
@@ -1345,10 +1288,13 @@ stack."
                          `(:snippet ,snippet)))))))
 
 (defun code-location-debug-source-name (code-location)
-  (namestring (truename (#.(swank/backend:choose-symbol
-                            'sb-c 'debug-source-name
-                            'sb-c 'debug-source-namestring)
-                           (sb-di::code-location-debug-source code-location)))))
+  (namestring (truename (#+#.(swank/backend:with-symbol
+                              'debug-source-name 'sb-di)
+                             sb-c::debug-source-name
+                             #-#.(swank/backend:with-symbol
+                                  'debug-source-name 'sb-di)
+                             sb-c::debug-source-namestring
+                         (sb-di::code-location-debug-source code-location)))))
 
 (defun code-location-debug-source-created (code-location)
   (sb-c::debug-source-created
@@ -1419,27 +1365,27 @@ stack."
          ;; specially.
          (more-name (or (find-symbol "MORE" :sb-debug) 'more))
          (more-context nil)
-         (more-count nil))
+         (more-count nil)
+         (more-id 0))
     (when vars
       (let ((locals
               (loop for v across vars
-                    unless 
-                    (case (debug-var-info v)
-                      (:more-context
-                       (setf more-context (debug-var-value v frame loc))
-                       t)
-                      (:more-count
-                       (setf more-count (debug-var-value v frame loc))
-                       t))
+                    do (when (eq (sb-di:debug-var-symbol v) more-name)
+                         (incf more-id))
+                       (case (debug-var-info v)
+                         (:more-context
+                          (setf more-context (debug-var-value v frame loc)))
+                         (:more-count
+                          (setf more-count (debug-var-value v frame loc))))
                     collect
-                    (list :name (sb-di:debug-var-symbol v)
-                          :id (sb-di:debug-var-id v)
-                          :value (debug-var-value v frame loc)))))
+                       (list :name (sb-di:debug-var-symbol v)
+                             :id (sb-di:debug-var-id v)
+                             :value (debug-var-value v frame loc)))))
         (when (and more-context more-count)
           (setf locals (append locals
                                (list
                                 (list :name more-name
-                                      :id 0
+                                      :id more-id
                                       :value (multiple-value-list
                                               (sb-c:%more-arg-values
                                                more-context
@@ -1588,21 +1534,23 @@ stack."
                             append (label-value-line i value))))))))
 
 (defmethod emacs-inspect ((o function))
-    (cond ((sb-kernel:simple-fun-p o)
+  (let ((header (sb-kernel:widetag-of o)))
+    (cond ((= header sb-vm:simple-fun-header-widetag)
                    (label-value-line*
                     (:name (sb-kernel:%simple-fun-name o))
                     (:arglist (sb-kernel:%simple-fun-arglist o))
+                    (:self (sb-kernel:%simple-fun-self o))
                     (:next (sb-kernel:%simple-fun-next o))
                     (:type (sb-kernel:%simple-fun-type o))
                     (:code (sb-kernel:fun-code-header o))))
-          ((sb-kernel:closurep o)
+          ((= header sb-vm:closure-header-widetag)
                    (append
                     (label-value-line :function (sb-kernel:%closure-fun o))
                     `("Closed over values:" (:newline))
                     (loop for i below (1- (sb-kernel:get-closure-length o))
                           append (label-value-line
                                   i (sb-kernel:%closure-index-ref o i)))))
-          (t (call-next-method o))))
+          (t (call-next-method o)))))
 
 (defmethod emacs-inspect ((o sb-kernel:code-component))
   (append
@@ -1612,14 +1560,22 @@ stack."
     (:debug-info (sb-kernel:%code-debug-info o)))
    `("Constants:" (:newline))
    (loop for i from sb-vm:code-constants-offset
-         below
-         (#.(swank/backend:choose-symbol 'sb-kernel 'code-header-words
-                                         'sb-kernel 'get-header-data)
-            o)
+         below (sb-kernel:get-header-data o)
          append (label-value-line i (sb-kernel:code-header-ref o i)))
    `("Code:" (:newline)
-             ,(with-output-to-string (s)
-                (sb-disassem:disassemble-code-component o :stream s)))))
+             , (with-output-to-string (s)
+                 (cond ((sb-kernel:%code-debug-info o)
+                        (sb-disassem:disassemble-code-component o :stream s))
+                       (t
+                        (sb-disassem:disassemble-memory
+                         (sb-disassem::align
+                          (+ (logandc2 (sb-kernel:get-lisp-obj-address o)
+                                       sb-vm:lowtag-mask)
+                             (* sb-vm:code-constants-offset
+                                sb-vm:n-word-bytes))
+                          (ash 1 sb-vm:n-lowtag-bits))
+                         (ash (sb-kernel:%code-code-size o) sb-vm:word-shift)
+                         :stream s)))))))
 
 (defmethod emacs-inspect ((o sb-ext:weak-pointer))
           (label-value-line*
@@ -1742,12 +1698,6 @@ stack."
             (push mb *mailboxes*)
             mb))))
 
-  (defimplementation wake-thread (thread)
-    (let* ((mbox (mailbox thread))
-           (mutex (mailbox.mutex mbox)))
-      (sb-thread:with-recursive-lock (mutex)
-        (sb-thread:condition-broadcast (mailbox.waitqueue mbox)))))
-
   (defimplementation send (thread message)
     (let* ((mbox (mailbox thread))
            (mutex (mailbox.mutex mbox)))
@@ -1755,7 +1705,22 @@ stack."
         (setf (mailbox.queue mbox)
               (nconc (mailbox.queue mbox) (list message)))
         (sb-thread:condition-broadcast (mailbox.waitqueue mbox)))))
-  
+
+
+  (defun condition-timed-wait (waitqueue mutex timeout)
+    (macrolet ((foo ()
+                 (cond ((member :sb-lutex *features*) ; Darwin
+                        '(sb-thread:condition-wait waitqueue mutex))
+                       (t
+                        '(handler-case
+                          (let ((*break-on-signals* nil))
+                            (sb-sys:with-deadline (:seconds timeout
+                                                            :override t)
+                              (sb-thread:condition-wait waitqueue mutex) t))
+                          (sb-ext:timeout ()
+                           nil))))))
+      (foo)))
+
   (defimplementation receive-if (test &optional timeout)
     (let* ((mbox (mailbox (current-thread)))
            (mutex (mailbox.mutex mbox))
@@ -1770,7 +1735,7 @@ stack."
              (setf (mailbox.queue mbox) (nconc (ldiff q tail) (cdr tail)))
              (return (car tail))))
          (when (eq timeout t) (return (values nil t)))
-         (sb-thread:condition-wait waitq mutex)))))
+         (condition-timed-wait waitq mutex 0.2)))))
 
   (let ((alist '())
         (mutex (sb-thread:make-mutex :name "register-thread")))
@@ -1789,7 +1754,33 @@ stack."
 
     (defimplementation find-registered (name)
       (sb-thread:with-mutex (mutex)
-        (cdr (assoc name alist))))))
+        (cdr (assoc name alist)))))
+
+  ;; Workaround for deadlocks between the world-lock and auto-flush-thread
+  ;; buffer write lock.
+  ;;
+  ;; Another alternative would be to grab the world-lock here, but that's less
+  ;; future-proof, and could introduce other lock-ordering issues in the
+  ;; future.
+  ;;
+  ;; In an ideal world we would just have an :AROUND method on
+  ;; SLIME-OUTPUT-STREAM, and be done, but that class doesn't exist when this
+  ;; file is loaded -- so first we need a dummy definition that will be
+  ;; overridden by swank-gray.lisp.
+  #.(unless (find-package 'swank/gray) (make-package 'swank/gray) nil)
+  (eval-when (:load-toplevel :execute)
+    (unless (find-package 'swank/gray) (make-package 'swank/gray) nil))
+  (defclass swank/gray::slime-output-stream
+      (sb-gray:fundamental-character-output-stream)
+    ())
+  (defmethod sb-gray:stream-force-output
+      :around ((stream swank/gray::slime-output-stream))
+    (handler-case
+        (sb-sys:with-deadline (:seconds 0.1)
+          (call-next-method))
+      (sb-sys:deadline-timeout ()
+        nil)))
+  )
 
 (defimplementation quit-lisp ()
   #+#.(swank/backend:with-symbol 'exit 'sb-ext)
@@ -1857,14 +1848,6 @@ stack."
 (defimplementation hash-table-weakness (hashtable)
   #+#.(swank/sbcl::sbcl-with-weak-hash-tables)
   (sb-ext:hash-table-weakness hashtable))
-
-;;; Floating point
-
-(defimplementation float-nan-p (float)
-  (sb-ext:float-nan-p float))
-
-(defimplementation float-infinity-p (float)
-  (sb-ext:float-infinity-p float))
 
 #-win32
 (defimplementation save-image (filename &optional restart-function)
@@ -2013,11 +1996,3 @@ stack."
            (values-list retlist))
       (when after
         (funcall after (if completed retlist :exited-non-locally))))))
-
-#+#.(swank/backend:with-symbol 'comma-expr 'sb-impl)
-(progn
-  (defmethod sexp-in-bounds-p ((s sb-impl::comma) i)
-    (= i 1))
-
-  (defmethod sexp-ref ((s sb-impl::comma) i)
-    (sb-impl::comma-expr s)))

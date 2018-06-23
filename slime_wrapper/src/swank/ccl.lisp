@@ -84,6 +84,10 @@
    openmcl-mop:slot-boundp-using-class
    openmcl-mop:slot-makunbound-using-class))
 
+(defmacro swank-sym (sym)
+  (let ((str (symbol-name sym)))
+    `(or (find-symbol ,str :swank)
+         (error "There is no symbol named ~a in the SWANK package" ,str))))
 ;;; UTF8
 
 (defimplementation string-to-utf8 (string)
@@ -329,9 +333,10 @@
 ;; such as *emacs-connection*.
 (defun find-repl-thread ()
   (let* ((*break-on-signals* nil)
-         (conn (swank::default-connection)))
-    (and (swank::multithreaded-connection-p conn)
-         (swank::mconn.repl-thread conn))))
+         (conn (funcall (swank-sym default-connection))))
+    (and conn
+         (ignore-errors ;; this errors if no repl-thread
+           (funcall (swank-sym repl-thread) conn)))))
 
 (defimplementation call-with-debugger-hook (hook fun)
   (let ((*debugger-hook* hook)
@@ -626,36 +631,23 @@
     (:type
      (describe (or (find-class symbol nil) symbol)))))
 
-;; spec ::= (:defmethod <name> {<qualifier>}* ({<specializer>}*))
-(defun parse-defmethod-spec (spec)
-  (values (second spec)
-          (subseq spec 2 (position-if #'consp spec))
-          (find-if #'consp (cddr spec))))
-
 (defimplementation toggle-trace (spec)
   "We currently ignore just about everything."
-  (let ((what (ecase (first spec)
-                ((setf)
-                 spec)
-                ((:defgeneric)
-                 (second spec))
-                ((:defmethod)
-                 (multiple-value-bind (name qualifiers specializers)
-                     (parse-defmethod-spec spec)
-                   (find-method (fdefinition name)
-                                qualifiers
-                                specializers))))))
-    (cond ((member what (trace) :test #'equal)
-           (ccl::%untrace what)
-           (format nil "~S is now untraced." what))
-          (t
-           (ccl:trace-function what)
-           (format nil "~S is now traced." what)))))
+  (ecase (car spec)
+    (setf
+     (ccl:trace-function spec))
+    ((:defgeneric)
+     (ccl:trace-function (second spec)))
+    ((:defmethod)
+     (destructuring-bind (name qualifiers specializers) (cdr spec)
+       (ccl:trace-function
+        (find-method (fdefinition name) qualifiers specializers)))))
+  t)
 
 ;;; Macroexpansion
 
-(defimplementation macroexpand-all (form &optional env)
-  (ccl:macroexpand-all form env))
+(defimplementation macroexpand-all (form)
+  (ccl:macroexpand-all form))
 
 ;;;; Inspection
 
@@ -800,12 +792,6 @@
             (nconc (mailbox.queue mbox) (list message)))
       (ccl:signal-semaphore (mailbox.semaphore mbox)))))
 
-(defimplementation wake-thread (thread)
-  (let* ((mbox (mailbox thread))
-         (mutex (mailbox.mutex mbox)))
-    (ccl:with-lock-grabbed (mutex)
-      (ccl:signal-semaphore (mailbox.semaphore mbox)))))
-
 (defimplementation receive-if (test &optional timeout)
   (let* ((mbox (mailbox ccl:*current-process*))
          (mutex (mailbox.mutex mbox)))
@@ -820,7 +806,7 @@
                  (nconc (ldiff q tail) (cdr tail)))
            (return (car tail)))))
      (when (eq timeout t) (return (values nil t)))
-     (ccl:wait-on-semaphore (mailbox.semaphore mbox)))))
+     (ccl:timed-wait-on-semaphore (mailbox.semaphore mbox) 1))))
 
 (let ((alist '())
       (lock (ccl:make-lock "register-thread")))

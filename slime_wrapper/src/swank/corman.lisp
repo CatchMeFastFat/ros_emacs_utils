@@ -265,8 +265,7 @@
 (defimplementation default-directory ()
   (directory-namestring (ccl:current-directory)))
 
-(defimplementation macroexpand-all (form &optional env)
-  (declare (ignore env))
+(defimplementation macroexpand-all (form)
   (ccl:macroexpand-all form))
 
 ;;; Documentation

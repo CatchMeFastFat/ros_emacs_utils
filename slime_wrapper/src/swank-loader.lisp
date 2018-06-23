@@ -19,11 +19,11 @@
 
 (cl:defpackage :swank-loader
   (:use :cl)
-  (:export :init
-           :dump-image
-           :list-fasls
-           :*source-directory*
-           :*fasl-directory*))
+  (:export #:init
+           #:dump-image
+           #:list-fasls
+           #:*source-directory*
+           #:*fasl-directory*))
 
 (cl:in-package :swank-loader)
 
@@ -31,6 +31,9 @@
   (make-pathname :name nil :type nil
                  :defaults (or *load-pathname* *default-pathname-defaults*))
   "The directory where to look for the source.")
+
+(defvar *load-path* '()
+  "A list of directories to search for modules.")
 
 (defparameter *sysdep-files*
   #+cmu '((swank source-path-parser) (swank source-file-cache) (swank cmucl)
@@ -48,20 +51,19 @@
   #+ecl '((swank ecl) (swank gray))
   #+clasp '((swank clasp) (swank gray))
   #+mkcl '((swank mkcl) (swank gray))
-  #+mezzano '((swank mezzano) (swank gray))
   )
 
 (defparameter *implementation-features*
   '(:allegro :lispworks :sbcl :clozure :cmu :clisp :ccl :corman :cormanlisp
-    :armedbear :gcl :ecl :scl :mkcl :clasp :mezzano))
+    :armedbear :gcl :ecl :scl :mkcl :clasp))
 
 (defparameter *os-features*
   '(:macosx :linux :windows :mswindows :win32 :solaris :darwin :sunos :hpux
-    :unix :mezzano))
+    :unix))
 
 (defparameter *architecture-features*
   '(:powerpc :ppc :x86 :x86-64 :x86_64 :amd64 :i686 :i586 :i486 :pc386 :iapx386
-    :sparc64 :sparc :hppa64 :hppa :arm :armv5l :armv6l :armv7l :arm64
+    :sparc64 :sparc :hppa64 :hppa :arm :armv5l :armv6l :armv7l
     :pentium3 :pentium4
     :mips :mipsel
     :java-1.4 :java-1.5 :java-1.6 :java-1.7))
@@ -104,9 +106,7 @@
                 (subseq s 0 (position #\space s)))
   #+armedbear (lisp-implementation-version)
   #+ecl (ecl-version-string)
-  #+clasp (clasp-version-string)
-  #+mezzano (let ((s (lisp-implementation-version)))
-              (subseq s 0 (position #\space s))))
+  #+clasp (clasp-version-string))
 
 (defun unique-dir-name ()
   "Return a name that can be used as a directory name that is
@@ -136,20 +136,12 @@ operating system, and hardware architecture."
   "Returns true if NEW-FILE is newer than OLD-FILE."
   (> (file-write-date new-file) (file-write-date old-file)))
 
-(defun string-starts-with (string prefix)
-  (string-equal string prefix :end1 (min (length string) (length prefix))))
-
 (defun slime-version-string ()
   "Return a string identifying the SLIME version.
 Return nil if nothing appropriate is available."
-  (with-open-file (s (merge-pathnames "slime.el" *source-directory*)
+  (with-open-file (s (merge-pathnames "ChangeLog" *source-directory*)
                      :if-does-not-exist nil)
-    (when s
-      (loop with prefix = ";; Version: "
-            for line = (read-line s nil :eof)
-            until (eq line :eof)
-            when (string-starts-with line prefix)
-              return (subseq line (length prefix))))))
+    (and s (symbol-name (read s)))))
 
 (defun default-fasl-dir ()
   (merge-pathnames
@@ -173,8 +165,12 @@ Return nil if nothing appropriate is available."
   (fresh-line *error-output*)
   (pprint-logical-block (*error-output* () :per-line-prefix ";; ")
     (format *error-output*
-            "~%Error ~A ~A:~%  ~A~%"
-            context pathname condition)))
+            "~%Error while ~A ~A:~%  ~A~%Aborting.~%"
+            context pathname condition))
+  (when (equal (directory-namestring pathname)
+               (directory-namestring *fasl-directory*))
+    (ignore-errors (delete-file pathname)))
+  (abort))
 
 (defun compile-files (files fasl-dir load quiet)
   "Compile each file in FILES if the source is newer than its
@@ -184,30 +180,32 @@ If LOAD is true, load the fasl file."
         (state :unknown))
     (dolist (src files)
       (let ((dest (binary-pathname src fasl-dir)))
-        (handler-bind
-            ((error (lambda (c)
-                      (ecase state
-                        (:compile (handle-swank-load-error c "compiling" src))
-                        (:load    (handle-swank-load-error c "loading" dest))
-                        (:unknown (handle-swank-load-error c "???ing" src))))))
-          (when (or needs-recompile
-                    (not (probe-file dest))
-                    (file-newer-p src dest))
-            (ensure-directories-exist dest)
-            ;; need to recompile SRC, so we'll need to recompile
-            ;; everything after this too.
-            (setf needs-recompile t
-                  state :compile)
-            (or (compile-file src :output-file dest :print nil
+        (handler-case
+            (progn
+              (when (or needs-recompile
+                        (not (probe-file dest))
+                        (file-newer-p src dest))
+                (ensure-directories-exist dest)
+                ;; need to recompile SRC, so we'll need to recompile
+                ;; everything after this too.
+                (setq needs-recompile t)
+                (setq state :compile)
+                (or (compile-file src :output-file dest :print nil
                                   :verbose (not quiet))
-                ;; An implementation may not necessarily signal a
-                ;; condition itself when COMPILE-FILE fails (e.g. ECL)
-                (error "COMPILE-FILE returned NIL.")))
-          (when load
-            (setf state :load)
-            (load dest :verbose (not quiet))))))))
+                    ;; An implementation may not necessarily signal a
+                    ;; condition itself when COMPILE-FILE fails (e.g. ECL)
+                    (error "COMPILE-FILE returned NIL.")))
+              (when load
+                (setq state :load)
+                (load dest :verbose (not quiet))))
+          ;; Fail as early as possible
+          (serious-condition (c)
+            (ecase state
+              (:compile (handle-swank-load-error c "compiling" src))
+              (:load    (handle-swank-load-error c "loading" dest))
+              (:unknown (handle-swank-load-error c "???ing" src)))))))))
 
-#+cormanlisp
+#+(or cormanlisp)
 (defun compile-files (files fasl-dir load quiet)
   "Corman Lisp has trouble with compiled files."
   (declare (ignore fasl-dir))
@@ -243,42 +241,14 @@ If LOAD is true, load the fasl file."
           names))
 
 (defvar *swank-files*
-  `(packages
-    (swank backend) ,@*sysdep-files* (swank match) (swank rpc)
+  `((swank backend) ,@*sysdep-files* (swank match) (swank rpc)
     swank))
-
-(defvar *contribs*
-  '(swank-util swank-repl
-    swank-c-p-c swank-arglists swank-fuzzy
-    swank-fancy-inspector
-    swank-presentations swank-presentation-streams
-    #+(or asdf2 asdf3 sbcl ecl) swank-asdf
-    swank-package-fu
-    swank-hyperdoc
-    #+sbcl swank-sbcl-exts
-    swank-mrepl
-    swank-trace-dialog
-    swank-macrostep
-    swank-quicklisp)
-  "List of names for contrib modules.")
-
-(defun append-dir (absolute name)
-  (merge-pathnames
-   (make-pathname :directory `(:relative ,name) :defaults absolute)
-   absolute))
-
-(defun contrib-dir (base-dir)
-  (append-dir base-dir "contrib"))
 
 (defun load-swank (&key (src-dir *source-directory*)
                      (fasl-dir *fasl-directory*)
-                        quiet)
-  (with-compilation-unit ()
-    (compile-files (src-files *swank-files* src-dir) fasl-dir t quiet))
-  (funcall (q "swank::before-init")
-           (slime-version-string)
-           (list (contrib-dir fasl-dir)
-                 (contrib-dir src-dir))))
+                     quiet)
+  (compile-files (src-files *swank-files* src-dir) fasl-dir t quiet)
+  (funcall (q "swank::before-init")))
 
 (defun delete-stale-contrib-fasl-files (swank-files contrib-files fasl-dir)
   (let ((newest (reduce #'max (mapcar #'file-write-date swank-files))))
@@ -288,28 +258,16 @@ If LOAD is true, load the fasl file."
                    (<= (file-write-date fasl) newest))
           (delete-file fasl))))))
 
-(defun compile-contribs (&key (src-dir (contrib-dir *source-directory*))
-                           (fasl-dir (contrib-dir *fasl-directory*))
-                           (swank-src-dir *source-directory*)
-                           load quiet)
-  (let* ((swank-src-files (src-files *swank-files* swank-src-dir))
-         (contrib-src-files (src-files *contribs* src-dir)))
-    (delete-stale-contrib-fasl-files swank-src-files contrib-src-files
-                                     fasl-dir)
-    (compile-files contrib-src-files fasl-dir load quiet)))
-
 (defun loadup ()
-  (load-swank)
-  (compile-contribs :load t))
+  (load-swank))
 
 (defun setup ()
   (load-site-init-file *source-directory*)
   (load-user-init-file)
-  (when (#-clisp probe-file
-         #+clisp ext:probe-directory
-         (contrib-dir *source-directory*))
-    (eval `(pushnew 'compile-contribs ,(q "swank::*after-init-hook*"))))
   (funcall (q "swank::init")))
+
+(defun string-starts-with (string prefix)
+  (string-equal string prefix :end1 (min (length string) (length prefix))))
 
 (defun list-swank-packages ()
   (remove-if-not (lambda (package)
@@ -330,12 +288,11 @@ If LOAD is true, load the fasl file."
       (handler-bind ((package-error #'handle-package-error))
         (delete-package package)))))
 
-(defun init (&key delete reload load-contribs (setup t)
-                  (quiet (not *load-verbose*)))
+(defun init (&key delete reload (setup t)
+               (quiet (not *load-verbose*)))
   "Load SWANK and initialize some global variables.
 If DELETE is true, delete any existing SWANK packages.
 If RELOAD is true, reload SWANK, even if the SWANK package already exists.
-If LOAD-CONTRIBS is true, load all contribs
 If SETUP is true, load user init files and initialize some
 global variabes in SWANK."
   (when (and delete (find-package :swank))
@@ -344,14 +301,12 @@ global variabes in SWANK."
          (load-swank :quiet quiet))
         (t
          (warn "Not reloading SWANK.  Package already exists.")))
-  (when load-contribs
-    (compile-contribs :load t :quiet quiet))
   (when setup
     (setup)))
 
 (defun dump-image (filename)
   (init :setup nil)
-  (funcall (q "swank/backend:save-image") filename))
+  (funcall (q "swank-backend:save-image") filename))
 
 (defun list-fasls (&key (include-contribs t) (compile t)
                         (quiet (not *compile-verbose*)))
@@ -368,3 +323,40 @@ global variabes in SWANK."
               (collect-fasls (src-files *contribs*
                                         (contrib-dir *source-directory*))
                              (contrib-dir *fasl-directory*))))))
+
+
+;;;;;; Simple *require-module* function for asdf-loader.lisp.
+
+
+(defun module-binary-dir (src-file)
+  (flet ((dir-components (path)
+           (cdr (pathname-directory path))))
+    (make-pathname :directory
+                   (append
+                    (pathname-directory *fasl-directory*)
+                    (nthcdr (mismatch (dir-components *fasl-directory*)
+                                      (dir-components src-file)
+                                      :test #'equal)
+                            (dir-components src-file))))))
+
+(defun require-module (module)
+  (labels ((module () (string-upcase module))
+           (provided ()
+             (member (string-upcase (module)) *modules* :test #'string=)))
+    (unless (provided)
+      (let ((src-file
+              (some #'(lambda (dir)
+                        (probe-file (make-pathname
+                                     :name (string-downcase module)
+                                     :type "lisp"
+                                     :defaults dir)))
+                    *load-path*)))
+        (compile-files (list src-file)
+                       (module-binary-dir src-file)
+                       'load
+                       nil)
+        (require (module))
+        ;; Actually require itself should raise a similar error...
+        (assert (provided)
+                nil
+                "Required module ~s was not provided" module)))))
